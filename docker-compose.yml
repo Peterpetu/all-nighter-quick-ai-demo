@@ -1,0 +1,31 @@
+
+services:
+  db:
+    build:
+      context: ./db
+    volumes:
+      - db-data:/data
+
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      - db
+    volumes:
+      - ./backend:/app
+      - db-data:/app/data
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "3000:3000"
+
+volumes:
+  db-data:

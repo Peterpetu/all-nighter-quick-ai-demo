@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Node
+node_modules/
+
+# Docker
+*.log
+
+# SQLite
+*.sqlite3
+
+# VS Code
+.vscode/
+
+# Poetry
+.venv/
