@@ -1,32 +1,23 @@
-import logging
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.agents.task_creation_agent import TaskCreationAgent, TaskCreationOutput
+from app.agents.user_service_agent import UserServiceAgent, UserServiceOutput
 
-logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
 
+# Keep one orchestrator instance so its memory persists
+_service_agent = UserServiceAgent()
 
 class ChatRequest(BaseModel):
     message: str
 
-
-class ChatResponse(BaseModel):
-    data: TaskCreationOutput
-
-
-@router.post("/", response_model=ChatResponse)
+@router.post("/", response_model=UserServiceOutput)
 async def chat(req: ChatRequest):
     """
-    Always return a structured TaskCreationOutput (with .error if something went wrong).
+    Route all user messages to the UserServiceAgent.
+    It will internally call support agents and optionally the manage_task tool.
     """
-    agent = TaskCreationAgent()
     try:
-        result = await agent.run(req.message)
+        return await _service_agent.run(req.message)
     except Exception as e:
-        # Fallback if something very unexpected happens
-        logger.error("Chat handler unexpected error: %s", e, exc_info=True)
-        result = TaskCreationOutput(error="Internal error; please try again later")
-
-    return ChatResponse(data=result)
+        raise HTTPException(status_code=503, detail=str(e))
