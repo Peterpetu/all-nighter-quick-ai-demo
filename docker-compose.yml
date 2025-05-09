@@ -11,6 +11,8 @@ services:
       context: ./backend
     depends_on:
       - db
+    env_file:
+      - .env
     volumes:
       - ./backend:/app
       - db-data:/app/data

@@ -1,6 +1,6 @@
 # Commands for quick testing
 
-
+g
 ## API Test Commands
 
 ### Get all tasks
@@ -19,4 +19,8 @@ curl -Method POST http://localhost:8000/tasks -Headers @{ "Content-Type" = "appl
 
 ```powershell
 curl http://localhost:8000/tasks/999
+```
+
+```powershell
+curl -Method POST http://localhost:8000/chat -Headers @{ "Content-Type" = "application/json" } -Body '{"message":"Can you delete the car washing task completely?"}'
 ```
