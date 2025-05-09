@@ -22,12 +22,12 @@ services:
   frontend:
     build:
       context: ./frontend
+    env_file:
+      - .env              # pass through BACKEND_URL (see .env-example below)
+    ports:
+      - "3000:8501"       # map host:container (Streamlit listens on 8501)
     depends_on:
       - backend
-    volumes:
-      - ./frontend:/app
-    ports:
-      - "3000:3000"
 
 volumes:
   db-data:

@@ -23,4 +23,3 @@ class TaskUpdate(SQLModel):
     title: Optional[str] = None
     description: Optional[str] = None
     due_date: Optional[datetime] = None
-    completed: Optional[bool] = None

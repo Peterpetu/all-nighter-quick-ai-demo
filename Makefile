@@ -1,4 +1,4 @@
-.PHONY: build up down logs
+.PHONY: build up down logs flog
 
 build:
 	docker-compose build
@@ -11,3 +11,6 @@ down:
 
 logs:
 	docker-compose logs -f
+
+flog:
+	docker-compose logs -f frontend

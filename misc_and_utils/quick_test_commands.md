@@ -1,6 +1,6 @@
-# Commands for quick testing
+# Commands for quick testing via Powershell
 
-g
+cd
 ## API Test Commands
 
 ### Get all tasks
