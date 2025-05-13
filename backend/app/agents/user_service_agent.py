@@ -6,11 +6,11 @@ from pydantic import BaseModel, Field
 from pydantic_ai import RunContext
 from sqlmodel import select
 
-from .base import BaseAgent # Make sure BaseAgent is correctly defined and uses pydantic_ai.Agent
-from .task_creation_agent import TaskCreationAgent, TaskCreationOutput, TaskDeletionOutput
-from .user_intent_agent import UserIntentAndEmotionAgent, IntentEmotionOutput
-from .question_for_user_agent import QuestionForUserAgent, QuestionOutput
-from .task_status_agent import TaskStatusAgent, StatusOutput
+from app.agents.base import BaseAgent
+from app.agents.task_creation_agent import TaskCreationAgent
+from app.agents.user_intent_agent import UserIntentAndEmotionAgent, IntentEmotionOutput
+from app.agents.question_for_user_agent import QuestionForUserAgent, QuestionOutput
+from app.agents.task_status_agent import TaskStatusAgent, StatusOutput
 from app.db import get_session
 from app.models import Task
 
@@ -19,46 +19,51 @@ logger = logging.getLogger(__name__)
 
 class UserServiceOutput(BaseModel):
     """
-    /chat response:
-     - If a tool ran, `task` or `delete` is populated _and_ we include
-       a confirmation in `chat_response`.
-     - Otherwise, only `chat_response` holds the assistant’s reply.
+    /chat response structure:
+      - If we invoked the TaskCreationAgent, the plain text from that sub-agent is included in chat_response.
+      - Otherwise, chat_response is just the orchestrator's direct message.
+      - We also include the sub-agent results from intent, question, status for reference.
     """
-    task:           Optional[TaskCreationOutput]  = None
-    delete:         Optional[TaskDeletionOutput]  = None
     intent:         IntentEmotionOutput
     question:       QuestionOutput
     status:         StatusOutput
-    chat_response:  Optional[str]                  = Field(
+    chat_response:  Optional[str] = Field(
         None,
         description="Human-friendly confirmation or chat reply"
     )
 
-
 class UserServiceAgent(BaseAgent):
     def __init__(self) -> None:
-        # Load orchestrator prompt
+        # Load orchestrator prompt (updated to mention we have only one tool: talk_to_task_creation_agent)
         prompt_path = Path(__file__).parent / "system_prompts" / "user_service.md"
         if not prompt_path.exists():
             raise FileNotFoundError(f"Missing system prompt: {prompt_path}")
         system_prompt = prompt_path.read_text(encoding="utf-8")
 
-        # Initialize BaseAgent: it will discover @self.agent.tool()
+        # Initialize BaseAgent: single tool returns plain text from sub-agent
         super().__init__(
-            model="openai:gpt-4.1",
+            model="openai:gpt-4o",
             system_prompt=system_prompt,
-            # Accept tool outputs _or_ plain text
-            output_type=Union[TaskCreationOutput, TaskDeletionOutput, str],
-            memory_size=50,
+            # The final output from this agent can be either a direct string or a tool response (string),
+            # but we store it in the pydantic output model below (UserServiceOutput).
+            output_type=str,
+            memory_size=100,
         )
 
-        # Register manage_task tool
+        # Register a single tool: talk_to_task_creation_agent
         @self.agent.tool
-        async def manage_task(
+        async def talk_to_task_creation_agent(
             ctx: RunContext,
-            command: str = Field(..., description="create/update/delete instruction")
-        ) -> Union[TaskCreationOutput, TaskDeletionOutput]:
-            return await TaskCreationAgent().run(command)
+            instruction: str = Field(..., description="A free-form request to create/update/delete tasks.")
+        ) -> str:
+            """
+            The orchestrator calls this tool to communicate with the TaskCreationAgent using plain English.
+            TaskCreationAgent will internally use create/update/delete sub-tools as needed, then return text.
+            """
+            logger.info(f"[UserServiceAgent] talk_to_task_creation_agent invoked with instruction: {instruction}")
+            response = await TaskCreationAgent().run(instruction)
+            # Ensure we return a pure string
+            return response if isinstance(response, str) else str(response)
 
     async def run(
         self,
@@ -66,12 +71,20 @@ class UserServiceAgent(BaseAgent):
         injections: Optional[Dict[str, str]] = None,
         deps: Optional[int] = None,
     ) -> UserServiceOutput:
-        # 1) Gather helper-agent context (intent, question, status)
+        """
+        The main flow:
+          1) Use sub-agents to gather context: intent/emotion, clarifying question, task status summary.
+          2) Build prompt injections with these sub-agent outputs + existing tasks from the DB.
+          3) Let the LLM produce either a direct text reply, or invoke the 'talk_to_task_creation_agent' tool.
+          4) Return a structured output with the final chat_response plus the sub-agents' data.
+        """
+
+        # 1) Gather helper-agent context
         intent   = await UserIntentAndEmotionAgent().run(user_message)
         question = await QuestionForUserAgent().run(user_message)
         status   = await TaskStatusAgent().run(user_message)
 
-        # 2) Inject the full list of existing tasks
+        # 2) Get existing tasks for the injection
         session = next(get_session())
         tasks = session.exec(select(Task)).all()
         existing = (
@@ -93,45 +106,15 @@ class UserServiceAgent(BaseAgent):
         if injections:
             inj.update(injections)
 
-        # 4) Let the orchestrator LLM run:
-        result = await super().run(user_message, injections=inj, deps=deps)
+        logger.info(f"[UserServiceAgent] prompt injections: {inj}")
 
-        # 5) If the tool ran: result is a TaskCreationOutput or TaskDeletionOutput
-        if isinstance(result, TaskCreationOutput):
-            # Craft a human-friendly confirmation
-            confirm = (
-                f"✅ Created task #{result.id}: “{result.title}”"
-                + (f" due {result.due_date}" if result.due_date else "")
-            )
-            return UserServiceOutput(
-                task=result,
-                delete=None,
-                intent=intent,
-                question=question,
-                status=status,
-                chat_response=confirm,
-            )
+        # 4) Let the orchestrator LLM run. We expect a string output.
+        result_str = await super().run(user_message, injections=inj, deps=deps)
 
-        if isinstance(result, TaskDeletionOutput):
-            confirm = (
-                f"🗑️ Deleted task #{result.id}"
-                if result.deleted else f"❌ Could not delete task #{result.id}"
-            )
-            return UserServiceOutput(
-                task=None,
-                delete=result,
-                intent=intent,
-                question=question,
-                status=status,
-                chat_response=confirm,
-            )
-
-        # 6) Otherwise: plain-text chat (result is string)
+        # 5) Wrap everything in the final pydantic output
         return UserServiceOutput(
-            task=None,
-            delete=None,
             intent=intent,
             question=question,
             status=status,
-            chat_response=str(result),
+            chat_response=str(result_str),
         )

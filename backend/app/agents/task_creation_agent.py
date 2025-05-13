@@ -1,3 +1,5 @@
+# file: app/agents/task_creation_agent.py
+
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -10,17 +12,14 @@ from pydantic_ai import RunContext
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import select
 
+from app.agents.base import BaseAgent
 from app.db import get_session
 from app.models import Task, TaskCreate, TaskUpdate
-from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
 
-
+# Sub-tool outputs
 class TaskCreationOutput(BaseModel):
-    """
-    Structured output for create & update operations.
-    """
     id: Optional[int] = Field(None, description="Task ID")
     title: Optional[str] = None
     description: Optional[str] = None
@@ -28,11 +27,7 @@ class TaskCreationOutput(BaseModel):
     completed: Optional[bool] = False
     error: Optional[str] = Field(None, description="Error message, if any")
 
-
 class TaskDeletionOutput(BaseModel):
-    """
-    Structured output for delete operation.
-    """
     id: Optional[int] = Field(None, description="Task ID")
     deleted: Optional[bool] = False
     error: Optional[str] = Field(None, description="Error message, if any")
@@ -40,8 +35,8 @@ class TaskDeletionOutput(BaseModel):
 
 class TaskCreationAgent(BaseAgent):
     """
-    Agent that can create, update, and delete tasks via internal tools,
-    with visibility into existing tasks for multi-turn context.
+    Agent that can create, update, and delete tasks via internal sub-tools.
+    The final output from this agent is plain text summarizing the result.
     """
 
     def __init__(self):
@@ -51,12 +46,13 @@ class TaskCreationAgent(BaseAgent):
             raise FileNotFoundError(f"Missing system prompt: {prompt_path}")
         system_prompt = prompt_path.read_text(encoding="utf-8")
 
+        # We'll produce a final plain string describing success/failure
         super().__init__(
-            model="openai:gpt-4.1",
+            model="openai:gpt-4o",
             system_prompt=system_prompt,
-            tools=None,
-            output_type=TaskCreationOutput,
-            memory_size=20,
+            tools=[],
+            output_type=str,
+            memory_size=100,
         )
 
         # ---- Create Tool ----
@@ -69,12 +65,17 @@ class TaskCreationAgent(BaseAgent):
                 None, description="Due date (free-form, e.g. 'tomorrow at 9am')"
             ),
         ) -> TaskCreationOutput:
-            # Coerce FieldInfo → None
-            if isinstance(title, FieldInfo): title = None
-            if isinstance(description, FieldInfo): description = None
-            if isinstance(due_date, FieldInfo): due_date = None
+            """
+            Sub-tool: actually create a task in the DB.
+            The LLM calls this function to do the real DB operation.
+            """
+            if isinstance(title, FieldInfo):
+                title = None
+            if isinstance(description, FieldInfo):
+                description = None
+            if isinstance(due_date, FieldInfo):
+                due_date = None
 
-            # Parse free-form due_date
             parsed_due_obj = None
             parsed_due_str = None
             if due_date:
@@ -133,17 +134,19 @@ class TaskCreationAgent(BaseAgent):
             due_date: Optional[str] = Field(None, description="New due date"),
             completed: Optional[bool] = Field(None, description="Mark done?"),
         ) -> TaskCreationOutput:
-            # 1. Safe ID conversion
+            if isinstance(title, FieldInfo):
+                title = None
+            if isinstance(description, FieldInfo):
+                description = None
+            if isinstance(due_date, FieldInfo):
+                due_date = None
+            if isinstance(completed, FieldInfo):
+                completed = None
+
             try:
                 task_id = int(id)
             except (TypeError, ValueError):
                 return TaskCreationOutput(error=f"Invalid task ID: {id}")
-
-            # 2. Coerce FieldInfo → None
-            if isinstance(title, FieldInfo): title = None
-            if isinstance(description, FieldInfo): description = None
-            if isinstance(due_date, FieldInfo): due_date = None
-            if isinstance(completed, FieldInfo): completed = None
 
             # 3. Parse new due_date
             parsed_due_obj = None
@@ -186,8 +189,8 @@ class TaskCreationAgent(BaseAgent):
                 )
 
             # 6. Apply and commit
-            for field, val in update_data.items():
-                setattr(task, field, val)
+            for field_name, val in update_data.items():
+                setattr(task, field_name, val)
             task.updated_at = datetime.utcnow()
 
             try:
@@ -216,7 +219,6 @@ class TaskCreationAgent(BaseAgent):
             ctx: RunContext,
             id: int = Field(..., description="ID of the task to delete"),
         ) -> TaskDeletionOutput:
-            # Safe ID conversion
             try:
                 task_id = int(id)
             except (TypeError, ValueError):
@@ -240,30 +242,33 @@ class TaskCreationAgent(BaseAgent):
         user_message: str,
         injections: Optional[Dict[str, str]] = None,
         deps: Optional[int] = None,
-    ) -> TaskCreationOutput:
+    ) -> str:
         """
-        Override run to inject:
-          - Current timestamp
-          - Full list of existing tasks
+        We override run() to inject the current timestamp + existing tasks if we want.
+        Then we rely on the LLM to call the relevant sub-tool(s) and produce a final textual summary.
         """
         now = datetime.utcnow().isoformat()
 
-        # Fetch existing tasks
         session = next(get_session())
         tasks = session.exec(select(Task)).all()
         if tasks:
-            existing = "\n".join(
+            existing_tasks = "\n".join(
                 f"{t.id}: {t.title} (due {t.due_date.isoformat() if t.due_date else 'None'}, completed={t.completed})"
                 for t in tasks
             )
         else:
-            existing = "No existing tasks."
+            existing_tasks = "No existing tasks."
 
         inj: Dict[str, str] = {
             "Current timestamp": now,
-            "Existing tasks": existing,
+            "Existing tasks": existing_tasks,
         }
         if injections:
             inj.update(injections)
 
-        return await super().run(user_message, injections=inj, deps=deps)
+        # Call the base run, expecting a final string
+        result_str = await super().run(user_message, injections=inj, deps=deps)
+        if not isinstance(result_str, str):
+            # In case something else was returned
+            result_str = str(result_str)
+        return result_str

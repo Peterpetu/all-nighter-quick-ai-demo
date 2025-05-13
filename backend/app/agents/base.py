@@ -1,5 +1,8 @@
+# file: app/agents/base.py
+
 import os
 import logging
+import json
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Type, TypeVar
 
@@ -16,10 +19,9 @@ class BaseAgent:
     Base wrapper around pydantic_ai.Agent that:
       - explicitly injects OPENAI_API_KEY
       - holds a static system_prompt
-      - supports per-call message injections
-      - maintains a simple in-memory history
-      - feeds chat_history back into the LLM for context
-      - on any exception returns a fallback instance with `.error` set
+      - supports manual memory injection into the final prompt
+      - maintains a simple in-memory conversation history
+      - performs JSON-based "agent tracing" after each run
     """
 
     def __init__(
@@ -29,7 +31,7 @@ class BaseAgent:
         tools: Optional[List[Any]] = None,
         deps_type: Optional[Type[TDeps]] = None,
         output_type: Optional[Type[TOutput]] = None,
-        memory_size: int = 10,
+        memory_size: int = 50,
     ):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -40,7 +42,7 @@ class BaseAgent:
 
         agent_kwargs: Dict[str, Any] = {
             "model": model,
-            "system_prompt": system_prompt,
+            "system_prompt": system_prompt,  # also used by pydantic_ai
             "tools": tools or [],
             "api_key": api_key,
         }
@@ -50,7 +52,8 @@ class BaseAgent:
             agent_kwargs["output_type"] = output_type
 
         self.agent = Agent(**agent_kwargs)
-        # deque of {"role": "user"/"assistant", "content": str}
+
+        # We'll store each message in memory as: {"role": "user"/"assistant", "content": "..."}
         self.memory: Deque[Dict[str, str]] = deque(maxlen=memory_size)
 
     async def run(
@@ -60,44 +63,71 @@ class BaseAgent:
         deps: Optional[TDeps] = None,
     ) -> TOutput:
         """
-        Run the agent on a user message, including:
-          - injecting user_message (and any additional key:value lines)
-          - passing the last N messages as chat_history
-          - returning an instance of `output_type` with `.error` on failure
+        Build a final prompt with:
+          1) System prompt at the top.
+          2) Entire conversation so far (self.memory).
+          3) Additional context (injections).
+        Then pass it to the LLM as a single text block.
+
+        After we get a result, we do JSON-based tracing with flush=True.
         """
-        # 1. Record the raw user turn
+
+        # Step 1) Save the new user message into memory
         self.memory.append({"role": "user", "content": user_message})
 
-        # 2. Build the prompt with optional injections
-        lines: List[str] = []
-        if injections:
-            for k, v in injections.items():
-                lines.append(f"{k}: {v}")
-        lines.append(f"User message: {user_message}")
-        full_message = "\n".join(lines)
+        # Step 2) Build the final prompt
+        prompt_lines: List[str] = []
+        prompt_lines.append(f"System Prompt:\n{self.system_prompt}\n")
 
-        # 3. Call the LLM, feeding chat_history for context
+        prompt_lines.append("Conversation So Far:")
+        for turn in self.memory:
+            role_label = "User" if turn["role"] == "user" else "Assistant"
+            prompt_lines.append(f"{role_label}: {turn['content']}")
+
+        # Add any additional context
+        if injections:
+            prompt_lines.append("\nAdditional Context:")
+            for k, v in injections.items():
+                prompt_lines.append(f"{k}: {v}")
+
+        final_prompt = "\n".join(prompt_lines)
+
+        # Optional debug print of the final prompt
+        # print(f"[DEBUG] Final Prompt for {self.__class__.__name__}:\n{final_prompt}\n", flush=True)
+
+        # Step 3) Try to run the LLM
         try:
-            if deps is not None:
-                result = await self.agent.run(
-                    full_message,
-                    deps=deps,
-                    chat_history=list(self.memory),
-                )
-            else:
-                result = await self.agent.run(
-                    full_message,
-                    chat_history=list(self.memory),
-                )
+            result = await self.agent.run(
+                final_prompt,
+                deps=deps,
+                # Not passing chat_history=... since we embed memory ourselves
+            )
             output = result.output
         except Exception as e:
             logger.error(
                 "Agent %s failed: %s", self.__class__.__name__, e, exc_info=True
             )
             if self.output_type:
+                # Return an instance with .error if your output_type has that field
                 return self.output_type(error=str(e))  # type: ignore
             raise RuntimeError("AI service unavailable") from e
 
-        # 4. Record the assistant’s reply
+        # Step 4) Save assistant’s reply in memory
         self.memory.append({"role": "assistant", "content": str(output)})
+
+        # Step 5) Perform JSON-based "agent tracing" 
+        # We'll gather relevant data into a dict and print it with flush=True
+        trace_data = {
+            "agent_class": self.__class__.__name__,
+            "final_prompt": final_prompt,
+            "model_output": str(output),
+            "user_message": user_message,
+            "memory_size": len(self.memory),
+            "injections": injections or {},
+        }
+        # If your output_type is a pydantic model, we could add more info like error fields or success flags
+
+        print(json.dumps(trace_data, indent=2), flush=True)
+
+        # Finally, return the output
         return output
